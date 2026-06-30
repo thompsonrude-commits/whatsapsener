@@ -47,6 +47,10 @@ function App() {
   const [license, setLicense] = useState<{ valid: boolean; trialExpired: boolean; hoursLeft: number; machineId: string } | null>(null)
   const [licenseKey, setLicenseKey] = useState('')
   const [licenseError, setLicenseError] = useState('')
+  const [verifyOnImport, setVerifyOnImport] = useState(false)
+  const [isImportVerifying, setIsImportVerifying] = useState(false)
+  const isImportVerifyingRef = useRef(false)
+  const [importProgress, setImportProgress] = useState<{ current: number; total: number; valid: number } | null>(null)
   // 2. Helpers (Defined BEFORE useEffect to avoid hoisting issues)
   const loadData = async () => {
     const api = (window as any).api;
@@ -200,6 +204,11 @@ function App() {
     } catch(e) { console.error(e) }
   }
 
+  const handleStopImportVerification = () => {
+    setIsImportVerifying(false)
+    isImportVerifyingRef.current = false
+  }
+
   const handleImportContacts = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
@@ -212,24 +221,66 @@ function App() {
       const api = (window as any).api;
       if (!api) return;
       
-      const newContacts: any[] = [];
+      const parsed: any[] = [];
       lines.forEach((line, i) => {
         const parts = line.split(',');
         let phone = parts[0]?.trim() || '';
         phone = phone.replace(/\D/g, ''); // Extract only digits
         
         if (phone.length > 5) {
-          newContacts.push({ phone, name: parts[1]?.trim() || `Imported ${i+1}` });
+          parsed.push({ phone, name: parts[1]?.trim() || `Imported ${i+1}` });
         }
       });
       
-      if (newContacts.length > 0) {
-        await api.addContacts(newContacts);
-        await loadData();
-        setSuccess(`Imported ${newContacts.length} numbers successfully!`);
-        setError(null);
-      } else {
+      if (parsed.length === 0) {
         setError('No valid numbers found in file.');
+        return;
+      }
+
+      // If verify mode is on and WhatsApp is connected, check each number
+      if (verifyOnImport && status.isReady) {
+        setIsImportVerifying(true)
+        isImportVerifyingRef.current = true
+        setImportProgress({ current: 0, total: parsed.length, valid: 0 })
+        setError(null)
+
+        const verified: any[] = []
+        for (let i = 0; i < parsed.length; i++) {
+          if (!isImportVerifyingRef.current) break
+          try {
+            const isReg = await api.isRegistered(parsed[i].phone)
+            if (isReg) verified.push(parsed[i])
+          } catch (err) {
+            console.error('[Import Verify]', err)
+          }
+          // Update progress after each check so valid count is accurate
+          setImportProgress({ current: i + 1, total: parsed.length, valid: verified.length })
+          // Small delay to avoid hammering WhatsApp
+          await new Promise(r => setTimeout(r, 800))
+        }
+
+        setIsImportVerifying(false)
+        isImportVerifyingRef.current = false
+        setImportProgress(null)
+
+        if (verified.length > 0) {
+          await api.addContacts(verified)
+          await loadData()
+          setSuccess(`Verified & imported ${verified.length} of ${parsed.length} numbers active on WhatsApp.`)
+          setError(null)
+        } else {
+          setError('No numbers from the file are active on WhatsApp.')
+        }
+      } else {
+        // No verification — import all parsed numbers directly
+        if (verifyOnImport && !status.isReady) {
+          setError('Connect WhatsApp first to verify numbers, or disable verify mode.')
+          return
+        }
+        await api.addContacts(parsed);
+        await loadData();
+        setSuccess(`Imported ${parsed.length} numbers successfully!`);
+        setError(null);
       }
     };
     reader.readAsText(file);
@@ -455,10 +506,20 @@ function App() {
                      </div>
                      <div className="mt-1 flex items-center justify-between shrink-0">
                         <div className="flex items-center gap-1.5 bg-gray-50 border rounded px-1.5 py-0.5 shadow-sm">
-                           <label className="cursor-pointer flex items-center gap-1 text-[8px] font-black text-[#00A884] uppercase tracking-wider hover:text-[#009272] transition-colors">
+                           <label className={`cursor-pointer flex items-center gap-1 text-[8px] font-black uppercase tracking-wider transition-colors ${isImportVerifying ? 'text-gray-300 pointer-events-none' : 'text-[#00A884] hover:text-[#009272]'}`}>
                               <Plus className="w-2.5 h-2.5" /> IMPORT
-                              <input type="file" accept=".csv,.txt" className="hidden" onChange={handleImportContacts} />
+                              <input type="file" accept=".csv,.txt" className="hidden" onChange={handleImportContacts} disabled={isImportVerifying} />
                            </label>
+                           <div className="w-px h-3 bg-gray-200 mx-0.5" />
+                           {/* Verify toggle */}
+                           <button
+                             onClick={() => setVerifyOnImport(v => !v)}
+                             title={verifyOnImport ? 'Verify mode ON — only active WhatsApp numbers will be imported' : 'Verify mode OFF — all numbers imported without checking'}
+                             className={`flex items-center gap-0.5 text-[7px] font-black uppercase tracking-wider transition-colors rounded px-0.5 py-0.5 ${verifyOnImport ? 'text-white bg-[#00A884]' : 'text-gray-400 bg-gray-100 hover:bg-gray-200'}`}
+                           >
+                             <ShieldCheck className="w-2.5 h-2.5" />
+                             <span>VERIFY {verifyOnImport ? 'ON' : 'OFF'}</span>
+                           </button>
                            <div className="w-px h-3 bg-gray-200 mx-0.5" />
                            <span className="text-[7px] font-black text-gray-400">QUEUED: {contacts.length}</span>
                         </div>
@@ -470,6 +531,24 @@ function App() {
                            {isSending ? 'STOP' : 'SEND'}
                         </button>
                      </div>
+                     {/* Import verification progress bar */}
+                     {isImportVerifying && importProgress && (
+                       <div className="mt-1 shrink-0">
+                         <div className="flex items-center justify-between mb-0.5">
+                           <span className="text-[7px] font-black text-[#00A884] uppercase flex items-center gap-1">
+                             <ShieldCheck className="w-2 h-2" />
+                             Checking {importProgress.current}/{importProgress.total} — <span className="text-[#25D366]">{importProgress.valid} active</span>
+                           </span>
+                           <button onClick={handleStopImportVerification} className="text-[7px] font-black text-red-400 uppercase hover:text-red-600">STOP</button>
+                         </div>
+                         <div className="w-full bg-gray-100 rounded-full h-1.5 overflow-hidden">
+                           <div
+                             className="h-full bg-[#00A884] rounded-full transition-all duration-300"
+                             style={{ width: `${(importProgress.current / importProgress.total) * 100}%` }}
+                           />
+                         </div>
+                       </div>
+                     )}
                   </div>
 
                   {/* Typing Simulation Preview */}
